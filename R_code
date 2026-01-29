@@ -1,0 +1,514 @@
+#libraries
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(tidyverse)
+library(forcats)
+library(ggplot2)
+library(pROC)
+library(fastDummies)
+
+# Reading data -------
+
+dat_arrangement <- read.csv("dat_arrangement.csv", na.strings = c("#NA", "NA"))
+dat_obligor <- read.csv("dat_obligor.csv", na.strings = c("#NA", "NA"))
+dat_scoring <- read.csv("dat_scoring.csv", na.strings = c("#NA", "NA"))
+par_model <- read.csv("par_model.csv", na.strings = c("#NA", "NA"))
+par_pools <- read.csv("par_pools.csv", na.strings = c("#NA", "NA"))
+
+##############
+# Data pre-processing
+##############
+
+# IP_ID missing in scoring data set:
+missing_IP <- dat_obligor %>%
+  distinct(IP_ID) %>%
+  anti_join(dat_scoring %>% distinct(IP_ID), by = "IP_ID")
+
+# Fixing IP_ID coding:
+dat_obligor_fix <- dat_obligor %>%
+  mutate(IP_ID = str_replace_all(IP_ID, "_", ""))
+
+length(unique(dat_obligor_fix$IP_ID)) # 14000 - same
+
+#Checking after cleaning:
+missing_IP <- dat_obligor_fix %>%
+  distinct(IP_ID) %>%
+  anti_join(dat_scoring %>% distinct(IP_ID), by = "IP_ID") #none now, both ways
+
+# Arrangement ID's, missing in Arrangement data set:
+
+missing_AR <- dat_scoring %>%
+  distinct(AR_ID, YEAR) %>%
+  anti_join(dat_arrangement %>% distinct(AR_ID, YEAR), by = c("AR_ID", "YEAR"))
+
+# Checking if any year-ID is missing from scoring data (other way around)
+missing_AR <- dat_arrangement %>%
+  distinct(AR_ID, YEAR) %>%
+  anti_join(dat_scoring %>% distinct(AR_ID, YEAR), by = c("AR_ID", "YEAR"))
+# None
+missing_IP <- dat_obligor_fix %>%
+  distinct(IP_ID, YEAR) %>%
+  anti_join(dat_scoring %>% distinct(IP_ID, YEAR), by = c("IP_ID", "YEAR"))
+#OK
+
+# Checking for duplicates
+dup <- dat_arrangement %>%
+  count(AR_ID, YEAR) %>%
+  filter(n > 1)
+
+dat_obligor_fix %>%
+  count(IP_ID, YEAR) %>%
+  filter(n > 1) 
+#None
+
+dat_scoring %>%
+  count(AR_ID, YEAR) %>%
+  filter(n > 1)
+#None
+
+# Removing incomplete (most NA's) duplicate row:
+dat_arrangement_fix <- dat_arrangement %>%
+  group_by(AR_ID, YEAR) %>%
+  arrange(rowSums(is.na(across(everything())))) %>%
+  slice(1) %>%
+  ungroup()
+
+# Joining data sets
+dat_portfolio <- dat_scoring %>%
+  left_join(dat_obligor_fix, by = c("IP_ID", "YEAR")) %>%
+  left_join(dat_arrangement_fix, by = c("AR_ID", "YEAR")) 
+
+#Checks:
+
+#No. rows match with the most complete dataset
+nrow(dat_portfolio) == nrow(dat_scoring) #TRUE
+
+# Duplicate keys
+dat_portfolio %>%
+  count(AR_ID, YEAR) %>%
+  filter(n > 1)
+# None
+
+# Fixing data types
+dat_portfolio <- dat_portfolio %>% 
+  mutate(AR_ID = as.character(AR_ID),
+         PD_POOL = factor(PD_POOL, levels = 1:5, ordered = TRUE),
+         TRUE_D = factor(DFLT_FLAG), # introduced to not overwrite numeric DFLT_FLAG
+         EDUCATION = factor(EDUCATION, levels = 1:3, ordered = TRUE))
+
+
+# Quick summary to check possible odd values or ranges, outliers.
+summary(dat_portfolio)
+
+# Replacing the abnormal values with NA's
+dat_portfolio <- dat_portfolio %>%
+  mutate(DPD_capped = ifelse(DPD > 730, NA, DPD)) #rough calculation 365*2
+
+# Checking missing values --------
+# For character variables, checking is any strage/empty strings are present (as NA's)
+missing_val <- c("N/A", "#NA", "##NA", "", "MISSING_VALUE", " ")
+sum(dat_portfolio$IP_ID %in% missing_val, na.rm = TRUE) 
+sum(dat_portfolio$AR_ID %in% missing_val, na.rm = TRUE)
+
+# Percentage of missing values per column/variable
+NA_perc <- sapply(dat_portfolio, function(x) sum(is.na(x)) * 100 / length(x))
+sort(NA_perc, decreasing = TRUE) 
+
+# total percentage of NA's
+(sum(is.na(dat_portfolio)) / (nrow(dat_portfolio) * ncol(dat_portfolio))) * 100
+
+# Inconsistencies in Default flag: -----
+# E.g., for RTD964 - 2023 marked as default, but not 2024
+dat_portfolio %>%
+  arrange(AR_ID, YEAR) %>%
+  group_by(AR_ID) %>%
+  mutate(DFLT_NEXT_Y = lead(DFLT_FLAG)) %>%
+  ungroup() %>%
+  count(DFLT_FLAG, DFLT_NEXT_Y)
+
+# 195 obs. has 1 previous year and 0 next year (accounting time error?)
+
+# Creating at risk data set ---------
+# Marking which year the deal first has reported (future) default (if any)
+# and removing subsequent years if marked as defaulted within 12 future months
+dat_risk <- dat_portfolio %>%
+  group_by(AR_ID) %>%
+  mutate(FIRST_DFLT_YEAR = ifelse(
+      any(DFLT_FLAG == 1, na.rm = TRUE),
+      min(YEAR[DFLT_FLAG == 1], na.rm = TRUE),NA)) %>%
+  ungroup() %>%
+  filter(is.na(FIRST_DFLT_YEAR) | YEAR <= FIRST_DFLT_YEAR)
+
+##############
+# Descriptive statistics 
+##############
+# Summmary tables ------
+
+# Portfolio summary - at risk data set
+
+portfolio_summary <- dat_risk %>%
+  group_by(YEAR) %>%
+  summarise(n_arrangements = n_distinct(AR_ID),
+    n_obligors = n_distinct(IP_ID),
+    n_defaults = sum(DFLT_FLAG == 1, na.rm = TRUE),
+    default_rate = mean(DFLT_FLAG == 1, na.rm = TRUE)) %>%
+  arrange(YEAR)
+
+
+# Adding total row for all years
+portfolio_summary_total <- portfolio_summary %>%
+  summarise(YEAR = "Total",
+    n_arrangements = sum(n_arrangements),
+    n_obligors = n_distinct(dat_risk$IP_ID),
+    n_defaults = sum(n_defaults),
+    default_rate = n_defaults / n_arrangements)
+
+portfolio_summary_final <- bind_rows(portfolio_summary %>% mutate(YEAR = as.character(YEAR)),
+                                     portfolio_summary_total)
+
+portfolio_summary_final <- portfolio_summary_final %>%
+  rename(Year = YEAR,
+    "Number of Arrangements" = n_arrangements,
+    "Number of Obligors" = n_obligors,
+    "Number of Defaults" = n_defaults,
+    "Default Rate" = default_rate) %>%
+  mutate(`Default Rate` = round(`Default Rate`, 3))
+  
+
+portfolio_summary_final %>%
+  kable("html", caption = "Portfolio summary per year") %>%
+  kable_styling(full_width = F, position = "center", bootstrap_options = c("striped", "hover"))
+
+# Summary statistics ------
+numeric_var <- c("PD", "AGE", "DEBT_RATIO", "M_LAST_DPD", "DPD_capped") # explain that capped DPD is used
+
+summary_stat_table <- dat_risk %>%
+  group_by(YEAR) %>%
+  summarise(across(all_of(numeric_var),
+                   list(
+                     N = ~sum(!is.na(.)),
+                     Mean = ~mean(., na.rm = TRUE),
+                     SD = ~sd(., na.rm = TRUE),
+                     Min = ~min(., na.rm = TRUE),
+                     Q1 = ~quantile(., 0.25, na.rm = TRUE),
+                     Median = ~median(., na.rm = TRUE),
+                     Q3 = ~quantile(., 0.75, na.rm = TRUE),
+                     Max = ~max(., na.rm = TRUE)),
+                   .names = "{.col}.{.fn}")) %>%
+  
+  pivot_longer(-YEAR, names_to = c("Variable", "Statistic"), names_sep = "\\.") %>%
+
+  pivot_wider(names_from = Statistic, values_from = value) %>%
+  arrange(Variable, YEAR)
+
+
+
+summary_stat_table <- summary_stat_table %>%
+  mutate(across(c(Mean, SD, Min, Q1, Median, Q3, Max), ~round(., 2)))
+
+summary_stat_table %>%
+  kable("html", caption = "Numeric portfolio summary per year") %>%
+  kable_styling(full_width = F, position = "center", bootstrap_options = c("striped", "hover"))
+
+
+# Histograms to visualize distribution/skeweness --------
+numeric_var <- c("PD", "AGE", "DEBT_RATIO", "M_LAST_DPD", "DPD_capped") # explain that capped DPD is used
+
+  
+  PD_hist <- ggplot(dat_risk, aes_string(x = "PD")) +
+    geom_histogram(bins = 10, fill = "#45b400", color = "black") +
+    facet_wrap(~ YEAR, scales = "free_x") + 
+    theme_minimal() +
+    labs(title = ("Distribution of PD by Year"),
+      x = "PD",
+      y = "Count")
+PD_hist #distribution for later years is bimodal - spikes for 0 and 1 
+
+AGE_hist <- ggplot(dat_risk, aes_string(x = "AGE")) +
+  geom_histogram(bins = 10, fill = "#45b400", color = "black") +
+  facet_wrap(~ YEAR, scales = "free_x") + 
+  theme_minimal() +
+  labs(title = ("Distribution of Obligor Age by Year"),
+    x = "Age",
+    y = "Count")
+AGE_hist 
+
+# DEBT_RATIO
+DEBT_RATIO_hist <- ggplot(dat_risk, aes_string(x = "DEBT_RATIO")) +
+  geom_histogram(bins = 10, fill = "#45b400", color = "black") +
+  facet_wrap(~ YEAR, scales = "free_x") + 
+  theme_minimal() +
+  labs(title = ("Distribution of Debt Ratio by Year"),
+    x = "Debt Ratio",
+    y = "Count")
+DEBT_RATIO_hist 
+
+# M_LAST_DPD
+M_LAST_DPD_hist <- ggplot(dat_risk, aes_string(x = "M_LAST_DPD")) +
+geom_histogram(bins = 10, fill = "#45b400", color = "black") +
+  facet_wrap(~ YEAR, scales = "free_x") + 
+  theme_minimal() +
+  labs(title = ("Distribution of Months since last Past Due by Year"),
+    x = "Months since last Past Due",
+    y = "Count")
+M_LAST_DPD_hist 
+
+# DPD_capped
+DPD_capped_hist <- ggplot(dat_risk, aes_string(x = "DPD_capped")) +
+  geom_histogram(bins = 10, fill = "#45b400", color = "black") +
+  facet_wrap(~ YEAR, scales = "free_x") + 
+  theme_minimal() +
+  labs(title = ("Distribution of Number of Past Due Days by Year"),
+    x = "Number of Past Due Days",
+    y = "Count")
+DPD_capped_hist 
+
+# Factor variables ------
+# PD_POOL
+pd_level_dist <- ggplot(dat_risk, aes(x = factor(YEAR),
+                                fill = fct_explicit_na(PD_POOL, na_level = "Missing"))) +
+  geom_bar(position = "fill") +                 
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Distribution of PD Levels by Years",
+    x = "Year",
+    y = "Percentage",
+    fill = "PD Level") +
+  theme_minimal()
+
+pd_level_dist
+
+# EDUCATION
+
+educ_dist <- ggplot(dat_risk, aes(x = factor(YEAR), fill = fct_explicit_na(EDUCATION, na_level = "Missing"))) +
+  geom_bar(position = "fill") +                 
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Distribution of Education Levels of Obligor by Years",
+    x = "Year",
+    y = "Percentage",
+    fill = "Education Level") +
+  theme_minimal()
+
+educ_dist
+
+# Box plots ----------
+# Debt Ratio per default status per year
+ggplot(dat_risk, aes(x = factor(DFLT_FLAG), y = DEBT_RATIO, fill = factor(DFLT_FLAG))) +
+  geom_boxplot(outlier.alpha = 0.3) + 
+  facet_wrap(~YEAR) +                 
+  labs(title = "Debt Ratio by Default Status per Year",
+    x = "Default Flag (within next 12 months)",
+    y = "Debt Ratio",
+    fill = "Default") +
+  theme_minimal()
+
+# M LAST per default status per year
+ggplot(dat_risk, aes(x = factor(DFLT_FLAG), y = M_LAST_DPD, fill = factor(DFLT_FLAG))) +
+  geom_boxplot(outlier.alpha = 0.3) + 
+  facet_wrap(~YEAR) +                 
+  labs(title = "Months since last due day by Default Status per Year",
+    x = "Default Flag (within next 12 months)",
+    y = "Months since last due day",
+    fill = "Default") +
+  theme_minimal()
+
+# DPD_capped
+ggplot(dat_risk, aes(x = factor(DFLT_FLAG), y = DPD_capped, fill = factor(DFLT_FLAG))) +
+  geom_boxplot(outlier.alpha = 0.3) + 
+  facet_wrap(~YEAR) +                 
+  labs(title = "DPD by Default Status per Year",
+    x = "Default Flag (within next 12 months)",
+    y = "Days of Past Due",
+    fill = "Default") +
+  theme_minimal()
+
+# Age
+ggplot(dat_risk, aes(x = factor(DFLT_FLAG), y = AGE, fill = factor(DFLT_FLAG))) +
+  geom_boxplot(outlier.alpha = 0.3) + 
+  facet_wrap(~YEAR) +                 
+  labs(title = "Age of Obligor by Default Status per Year",
+       x = "Default Flag (within next 12 months)",
+       y = "Age",
+       fill = "Default") +
+  theme_minimal()
+
+###########
+# 3. Assess correctness of PD estimate calculation
+###########
+# Basic sanity checks
+summary(dat_risk$PD) 
+sd(dat_risk$PD) 
+
+# Checking if PD_POOL levels are consistent -----
+
+pd_pool_check <- dat_risk %>%
+  filter(!is.na(PD_POOL)) %>% 
+  group_by(PD_POOL) %>%
+  summarise(min_PD = min(PD, na.rm = TRUE),
+            max_PD = max(PD, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~round(., 4))) 
+
+pd_pool_check 
+
+# PD pool assignment is consistent with the definition and bins provided
+
+
+# Checking if any points are on the boundry and how the sorting behaves then
+PD_min_VEC <- par_pools$START
+PD_max_VEC <- par_pools$END
+
+dat_risk <- dat_risk %>%
+  mutate(
+    PD_min = PD_min_VEC[as.numeric(PD_POOL)],
+    PD_max = PD_max_VEC[as.numeric(PD_POOL)],
+    on_boundary = PD == PD_min | PD == PD_max
+  )
+
+dat_risk %>%
+  filter(on_boundary) %>%
+  select(AR_ID, PD)
+
+# None are on the boundary - as perhaps expected since PD is not rounded
+
+# Re-calculating the raw PD estimates according to the model coeficients ----------------
+
+Intercept <- par_model$ESTIMATE[1]
+Age_coef <- par_model$ESTIMATE[2]
+Educ_coef_1 <- par_model$ESTIMATE[3]
+Educ_coef_2 <- par_model$ESTIMATE[4]
+debt_coef <- par_model$ESTIMATE[6]
+max_dpd_coef <- par_model$ESTIMATE[7]
+min_m_dpd_coef <- par_model$ESTIMATE[8] 
+
+# Creating MX DPD and MIN M_LAST_DPD variables per obligor
+dat_risk <- dat_risk %>%
+  group_by(IP_ID) %>%
+  mutate(MAX_DPD = ifelse(all(is.na(DPD_capped)), NA,  max(DPD_capped, na.rm = TRUE)),
+         MIN_M_LAST = ifelse(all(is.na(M_LAST_DPD)), NA,min(M_LAST_DPD, na.rm = TRUE))) %>%
+  
+  ungroup()
+
+# dummy encoding for education
+
+dat_risk <- dummy_cols(
+  dat_risk,
+  select_columns = "EDUCATION",
+  remove_selected_columns = FALSE
+)
+
+# Replacing NA's by given values:
+dat_evaluation <- dat_risk %>%
+  mutate(AGE = ifelse(is.na(AGE), par_model$MISSING_VALUE[2], AGE),
+         EDUCATION_1 = ifelse(is.na(EDUCATION_1), par_model$MISSING_VALUE[3], EDUCATION_1),
+         EDUCATION_2 = ifelse(is.na(EDUCATION_2), par_model$MISSING_VALUE[4], EDUCATION_2),
+         DEBT_RATIO = ifelse(is.na(DEBT_RATIO), par_model$MISSING_VALUE[6], DEBT_RATIO),
+         MAX_DPD = ifelse(is.na(MAX_DPD), par_model$MISSING_VALUE[7], MAX_DPD),
+         MIN_M_LAST = ifelse(is.na(MIN_M_LAST), par_model$MISSING_VALUE[8], MIN_M_LAST))
+
+
+# FLOORING/CAPPING AND SCALING numeric variables (values are given)
+cap_floor <- function(x, min, max) {
+  x[x < min] <- min
+  x[x > max] <- max
+  x
+}
+
+scale_fixed <- function(x, mean, sd) {
+  (x - mean) / sd
+}
+
+dat_evaluation <- dat_evaluation %>%
+  mutate(AGE = cap_floor(AGE, par_model$MIN[2], par_model$MAX[2]),
+         DEBT_RATIO = cap_floor(DEBT_RATIO, par_model$MIN[6], par_model$MAX[6]),
+         MAX_DPD  = cap_floor(MAX_DPD, par_model$MIN[7], par_model$MAX[7]),
+         MIN_M_LAST = cap_floor(MIN_M_LAST, par_model$MIN[8], par_model$MAX[8]))
+
+dat_evaluation <- dat_evaluation %>%
+  mutate(AGE = scale_fixed(AGE, par_model$MEAN[2], par_model$ST.DEV[2]),
+         DEBT_RATIO =scale_fixed(DEBT_RATIO, par_model$MEAN[6], par_model$ST.DEV[6]),
+         MAX_DPD  = scale_fixed(MAX_DPD, par_model$MEAN[7], par_model$ST.DEV[7]),
+         MIN_M_LAST = scale_fixed(MIN_M_LAST, par_model$MEAN[8], par_model$ST.DEV[8]))
+
+
+# Re-calculating:
+dat_evaluation <- dat_evaluation %>%
+  mutate(PD_recalc = 1 / (1 + exp(-(Intercept + Age_coef*AGE + debt_coef*DEBT_RATIO 
+                                    + max_dpd_coef*MAX_DPD + min_m_dpd_coef*MIN_M_LAST +
+                                      Educ_coef_1*EDUCATION_1 + Educ_coef_2*EDUCATION_2))))
+
+
+# Calculating difference:
+dat_evaluation <- dat_evaluation %>%
+  mutate(PD_diff = PD - PD_recalc)
+
+summary(dat_evaluation$PD_diff)
+sd(dat_evaluation$PD_diff, na.rm = TRUE) #LARGE SPREAD
+hist(dat_evaluation$PD_diff) 
+
+max(abs(dat_evaluation$PD_diff), na.rm = TRUE) 
+
+# Which rows have large diff
+estimation_diff <- dat_evaluation %>%
+  filter(abs(PD_diff) > 0.9) %>%
+  select(AR_ID, YEAR, PD_recalc, PD_diff)
+
+# Looking them up in original data set
+dat_portfolio_diff <- dat_risk %>%
+  inner_join(estimation_diff, by = c("AR_ID", "YEAR"))
+
+
+# around 10% of obs. have mismatch in estimates
+nrow(dat_portfolio_diff)/nrow(dat_risk)
+
+###############
+# Model evaluation
+###############
+
+# Summary table
+dat_risk %>%
+  group_by(DFLT_FLAG) %>%
+  summarise(mean_pd = mean(PD, na.rm = TRUE))
+
+# PD by default flag
+ggplot(dat_risk, aes(x = PD)) +
+  geom_histogram(binwidth = .05) +
+  facet_wrap(~DFLT_FLAG) +
+  xlab("Probability of Default")
+
+
+# Calibration plot
+dat_risk <- dat_risk %>%
+  filter(!is.na(PD), !is.na(DFLT_FLAG)) %>%
+  mutate(PD_bin = cut(PD,
+                      breaks = seq(0, 1, by = 0.1),  
+                      include.lowest = TRUE))
+
+calibration <- dat_risk %>%
+  group_by(PD_bin) %>%
+  summarise(
+    mean_PD = mean(PD),
+    default_rate = mean(DFLT_FLAG),
+    n = n()
+  ) %>%
+  filter(n > 0)  
+
+ggplot(calibration, aes(x = mean_PD, y = default_rate)) +
+  geom_point(size = 3, color = "darkgreen") +
+  geom_line(color = "darkgreen") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title = "PD Calibration Plot",
+    x = "Average Predicted PD",
+    y = "Observed Default Rate"
+  ) +
+  theme_minimal()
+
+# ROC curve
+rocCurve <- roc(response = dat_risk$DFLT_FLAG,
+predictor = dat_risk$PD,
+levels = levels(dat_risk$TRUE_D))
+
+auc(rocCurve) # AUC is high
+
+plot(rocCurve, legacy.axes = TRUE)
